@@ -25,11 +25,17 @@ from seq2seq.utils import AverageMeter
 from seq2seq.utils import gnmt_print
 from seq2seq.utils import sync_workers
 
-
+# 4.2.1.3 创建图
+# create_graph 的作用就是使用torchgraph.GraphCreator创建一个图，
+# 这个图就可以理解为模型内部的DAG图，每个节点记录如下信息。
+# node10 -- Dropout(p=0.2) -- forward_compute_time=0.064, backward_compute_time=0.128, activation_size=6291456.0, parameter_size=0.000
+# 具体代码如下：
 def create_graph(model, module_whitelist, model_input, summary, directory):
     """Given a model, creates and visualizes the computation DAG
        of the model in the passed-in directory."""
+    # 创建图
     graph_creator = torchgraph.GraphCreator(model, summary, module_whitelist)
+    # 构建hook
     graph_creator.hook_modules(model, root=True)
     (src, tgt) = model_input
     (src, src_length) = src
@@ -37,10 +43,13 @@ def create_graph(model, module_whitelist, model_input, summary, directory):
     src_length = torch.LongTensor(src_length).cuda()
     src = src.cuda()
     tgt = tgt.cuda()
+    # 运行以得到profile
     model(src, src_length, tgt[:-1])
     graph_creator.unhook_modules()
+    # 输出profile结果
     graph_creator.persist_graph(directory)
 
+# 4.2.1.1 训练过程
 class Seq2SeqTrainer:
     """
     Seq2SeqTrainer
@@ -200,9 +209,9 @@ class Seq2SeqTrainer:
         batch_size = data_loader.batch_size
         layer_timestamps = []
         verbose = True
-
+        # 白名单
         module_whitelist = ["EmuBidirLSTM", "RecurrentAttention", "Classifier"]
-
+        # 样本集
         for i, (src, tgt) in enumerate(data_loader):
             break
         (src, src_length) = src
@@ -211,6 +220,7 @@ class Seq2SeqTrainer:
         src = src.cuda()
         tgt = tgt.cuda()
         model_input = (src, src_length, tgt[:-1])
+        # 使用torchsummary计算网络的计算参数等信息
         summary = torchsummary.summary(model=self.model, module_whitelist=module_whitelist,
                                        model_input=model_input, verbose=True)
 
@@ -251,7 +261,7 @@ class Seq2SeqTrainer:
                 log += [f'BLEU: {test_bleu:.2f}']
                 log = '\t'.join(log)
                 logging.info(log)
-
+                # 训练模型
                 self.model.train()
                 self.preallocate(data_loader, training=True)
 
@@ -324,7 +334,7 @@ class Seq2SeqTrainer:
                 summary_elem['forward_time'] = per_layer_time[1]
                 summary_elem['backward_time'] = per_layer_time[2]
                 break
-
+        # 从模型建立图
         if training:
             create_graph(self.model, module_whitelist, (src, tgt), summary,
                          os.path.join("profiles", self.arch))

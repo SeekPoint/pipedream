@@ -15,6 +15,10 @@ import graph
 
 object_id = 0
 
+# 4.2.2.2 TensorWrapper
+# TensorWrapper 就实现了wrapper功能，graph_creator.summary 就是之前torchsummary.summary得到的网络等信息。
+# 可以看到此类会遍历 summary，计算 forward_compute_time 等信息，最终构建了一个 node。
+# 需要注意的是：activation_sizes 是根据 output_shape 来计算的。
 class TensorWrapper(object):
     def __init__(self, tensor, node_desc, graph_creator, activation_size=None):
         self.tensor = tensor
@@ -109,6 +113,14 @@ class TensorWrapper(object):
             self.graph_creator.graph.add_edge(other.node(), wrapped_result.node())
         return wrapped_result
 
+    '''
+    对于某些内置方法，则也会相应处理，比如如下。
+    最终对应：
+
+    node58 - - Add(
+        inplace) - - forward_compute_time = 0.000, backward_compute_time = 0.000, \
+        activation_size = 102760448.000, parameter_size = 0.000
+    '''
     def __iadd__(self, other):
         self_activation_size = self.node().activation_size
         other_activation_size = other.node().activation_size
@@ -180,7 +192,8 @@ def cat(wrapped_tensors, dim):
         graph_creator.graph.add_edge(wrapped_tensor.node(), wrapped_result.node())
     return wrapped_result
 
-
+# 4.2.2 创建图
+# 创建图基本是在 GraphCreator 内完成。
 class GraphCreator(object):
     def __init__(self, model, summary, module_whitelist):
         if isinstance(model, torch.nn.Module) is False:
@@ -193,6 +206,9 @@ class GraphCreator(object):
         self.graph = graph.Graph()
         self.inputs = {}
 
+    #4.2.2.1 设置wrapper
+    # hook_modules 的作用是给模型的forward函数设置一个wrapper，并且遍历为子模块设置，
+    # 这样在模型运行时候可以跟踪模型之间的联系。
     def hook_modules(self, module, root=False):
         this_creator = self
         sub_modules = module.__dict__['_modules']
@@ -201,21 +217,25 @@ class GraphCreator(object):
         def forward_wrapper(self, *wrapped_inputs):
             input = []
             wrapped_inputs_list = list(wrapped_inputs)
-            for i in range(len(wrapped_inputs_list)):
+            for i in range(len(wrapped_inputs_list)): # 遍历输入
                 if isinstance(wrapped_inputs_list[i], TensorWrapper):
+                    # 如果已经被包装，则插入input
                     input.append(wrapped_inputs_list[i].tensor)
                 else:
                     key = wrapped_inputs_list[i]
-                    if key in this_creator.inputs:
+                    if key in this_creator.inputs: # 如果是原始输入，则不进行包装
                         wrapped_inputs_list[i] = this_creator.inputs[key]
                     else:
                         j = len(this_creator.inputs)
+                        # 如果没有被wrap, 则构建一个TensorWrapper进行包装
                         wrapped_inputs_list[i] = TensorWrapper(wrapped_inputs_list[i],
                                                                "Input%d" % j, this_creator)
                         this_creator.inputs[key] = wrapped_inputs_list[i]
-                    input.append(wrapped_inputs_list[i].tensor)
+                    input.append(wrapped_inputs_list[i].tensor) # 则插入input
             result = this_creator.forward_original_methods[self](*input)
+            # 对结果进行包装
             wrapped_result = TensorWrapper(result, str(self), this_creator)
+            # 把边添加进入图
             for wrapped_input in wrapped_inputs_list:
                 this_creator.graph.add_edge(wrapped_input.node(), wrapped_result.node())
 
@@ -242,6 +262,7 @@ class GraphCreator(object):
 
             return result
 
+        # 遍历子模块，递归设置wrapper
         for name, sub_module in sub_modules.items():
             # nn.Module is the only thing we care about.
             if sub_module is None or isinstance(sub_module, torch.nn.Module) is False:
@@ -256,6 +277,7 @@ class GraphCreator(object):
                 #
 
                 # Replace "forward" with "wrapped_forward".
+                # 使用wrapped_forward替换forward
                 if sub_module not in this_creator.forward_original_methods:
                     this_creator.forward_original_methods.update({sub_module:
                                                                    sub_module.forward})
@@ -264,9 +286,9 @@ class GraphCreator(object):
             if len(sub_sub_modules) > 0 and sub_module_name not in self.module_whitelist:
                 #
                 # Recursively visit this module's descendants.
-                #
+                # 递归设置wrapper
                 self.hook_modules(sub_module)
-        if root:
+        if root: # 对于root进行处理
             this_creator.forward_original_methods.update({module: module.forward})
             module.forward = forward_wrapper_root.__get__(module, module.__class__)
 
@@ -274,6 +296,8 @@ class GraphCreator(object):
         for sub_module in self.forward_original_methods:
             sub_module.forward = self.forward_original_methods[sub_module]
 
+    # 4.2.3 持久化
+    # persist_graph 就是把profile结果输出到文件。
     def persist_graph(self, directory):
         self.graph.to_dot(os.path.join(directory, "graph.dot"))
         with open(os.path.join(directory, "graph.txt"), 'w') as f:

@@ -479,6 +479,7 @@ class Graph(object):
                     gr.edges[in_node_id].append(gr.nodes[node_id])
         return gr
 
+    # 具体调用了 graph.py 的函数完成，这里摘录 to_dot函数如下：
     def to_dot(self, arch):
         dot = graphviz.Digraph()
         for node in self.nodes.values():

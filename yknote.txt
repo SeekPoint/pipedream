@@ -1,0 +1,11 @@
+https://www.microsoft.com/en-us/research/project/fiddle/
+
+https://chenqll-blog.readthedocs.io/en/latest/doctor/big_model_training/parallel/deepspeed_pp.html
+deepspeed pipeline parallelism
+
+
+https://zhuanlan.zhihu.com/p/576673548
+深度学习大模型训练--DeepSpeed 源码解读
+
+https://github.com/microsoft/DeepSpeed/issues/1110
+Details about pipeline parallelism implementation in DeepSpeed
