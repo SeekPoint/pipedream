@@ -130,8 +130,31 @@ class SyntheticDataset(torch.utils.data.dataset.Dataset):
 
     def __len__(self):
         return self.length
+'''
+2.2 总体逻辑
+使用 runtime 的总体逻辑以如下文件为例 ：runtime/translation/main_with_runtime.py。主要逻辑是：
+
+    解析输入参数
+    加载，生成模型
+    依据模块来构建模型
+    依据参数进行配置比如输入大小，batch size等
+    遍历模型的每个层（跳过最后loss层）
+        遍历每层的输入，构建输入张量
+        通过调用stage对应的forward函数，构建出输出
+        遍历每层的输出，设置其类型和形状
+    构建输出值张量类型
+    加载配置文件
+    构建一个 StageRuntime
+    建立 optimizer
+    加载 dataset
+    进行训练，保存checkpoint
+    
+总体代码如下：
+'''
+
 
 def main():
+    # 解析输入参数
     global args, best_prec1
     args = parser.parse_args()
 
@@ -148,10 +171,13 @@ def main():
         vocab_size=tokenizer.vocab_size, padding_idx=config.PAD, smoothing=0.1)
 
     # create stages of the model
+    # 加载，生成模型
     module = importlib.import_module(args.module)
     args.arch = module.arch()
+    # 依据模块来构建模型
     model = module.model(criterion)
 
+    # 依据参数进行配置比如输入大小，batch size等
     input_size = [args.max_length_train, args.batch_size]
     training_tensor_shapes = {"input0": input_size, "input1": [args.batch_size],
                               "input2": input_size, "target": [args.max_length_train * args.batch_size],
@@ -160,8 +186,11 @@ def main():
               "target": torch.int64, "target_length": torch.int32}
     inputs_module_destinations = {"input0": 0, "input1": 0, "input2": 0}
     target_tensor_names = {"target", "target_length"}
+
+    # 遍历模型的每个层（跳过最后loss层）
     for module_id, (stage, inputs, outputs) in enumerate(model[:-1]):  # Skip last layer (loss).
         input_tensors = []
+        # 遍历每层的输入，构建输入张量
         for module_input in inputs:
             if module_input in inputs_module_destinations:
                 inputs_module_destinations[module_input] = module_id
@@ -174,21 +203,93 @@ def main():
         # synthetic inputs. Without the following line, the runtime is
         # as much as 1.5x slower in a full DP configuration.
         with torch.no_grad():
+            # 通过调用stage对应的forward函数，构建出输出
             output_tensors = stage(*tuple(input_tensors))
         if not type(output_tensors) is tuple:
             output_tensors = [output_tensors]
+        # 遍历每层的输出，设置其类型和形状
         for output, output_tensor in zip(outputs,
                                          list(output_tensors)):
+            # output 是 ['out2', 'out1']
             training_tensor_shapes[output] = list(output_tensor.size())
             dtypes[output] = output_tensor.dtype
 
+    # 构建输出值张量类型
     eval_tensor_shapes = {}
     for key in training_tensor_shapes:
         eval_tensor_shapes[key] = tuple(
             training_tensor_shapes[key])
         training_tensor_shapes[key] = tuple(
             training_tensor_shapes[key])
+    '''
+得到了输出的形状和类型。
 
+dtypes = {dict: 13} 
+ 'input0' = {dtype} torch.int64
+ 'input1' = {dtype} torch.int64
+ 'input2' = {dtype} torch.int64
+ 'target' = {dtype} torch.int64
+ 'target_length' = {dtype} torch.int32
+ 'out2' = {dtype} torch.float32
+ 'out1' = {dtype} torch.float32
+ 'out3' = {dtype} torch.float32
+ 'out7' = {dtype} torch.float32
+ 'out8' = {dtype} torch.float32
+ 'out9' = {dtype} torch.float32
+ 'out10' = {dtype} torch.float32
+ 'out12' = {dtype} torch.float32
+ __len__ = {int} 13
+  
+training_tensor_shapes = {dict: 13} 
+ 'input0' = {tuple: 2} (50, 128)
+ 'input1' = {tuple: 1} 128
+ 'input2' = {tuple: 2} (50, 128)
+ 'target' = {tuple: 1} 6400
+ 'target_length' = {tuple: 1} 128
+ 'out2' = {tuple: 3} (50, 128, 1024)
+ 'out1' = {tuple: 3} (50, 128, 1024)
+ 'out3' = {tuple: 3} (50, 128, 1024)
+ 'out7' = {tuple: 3} (50, 128, 1024)
+ 'out8' = {tuple: 3} (50, 128, 1024)
+ 'out9' = {tuple: 3} (50, 128, 1024)
+ 'out10' = {tuple: 3} (50, 128, 1024)
+ 'out12' = {tuple: 3} (50, 128, 32320)
+ __len__ = {int} 13
+
+eval_tensor_shapes = {dict: 13} {
+ 'input0' = {tuple: 2} (50, 128)
+ 'input1' = {tuple: 1} 128
+ 'input2' = {tuple: 2} (50, 128)
+ 'target' = {tuple: 1} 6400
+ 'target_length' = {tuple: 1} 128
+ 'out2' = {tuple: 3} (50, 128, 1024)
+ 'out1' = {tuple: 3} (50, 128, 1024)
+ 'out3' = {tuple: 3} (50, 128, 1024)
+ 'out7' = {tuple: 3} (50, 128, 1024)
+ 'out8' = {tuple: 3} (50, 128, 1024)
+ 'out9' = {tuple: 3} (50, 128, 1024)
+ 'out10' = {tuple: 3} (50, 128, 1024)
+ 'out12' = {tuple: 3} (50, 128, 32320)
+ __len__ = {int} 13
+     '''
+
+    #3.5 配置
+    # 加载上文生成的配置文件。
+    '''
+    对应的文件是：
+    
+    {
+        "module_to_stage_map": [0, 1, 2, 3, 3],
+        "stage_to_rank_map": {"0": [0], "1": [1], "2": [2], "3": [3]}
+    }
+    得到：
+    configuration_maps = {dict: 3} 
+     'module_to_stage_map' = {list: 5} [0, 1, 2, 3, 3]
+     'stage_to_rank_map' = {dict: 4} {0: [0], 1: [1], 2: [2], 3: [3]}
+     'stage_to_depth_map' = {NoneType} None
+     __len__ = {int} 3
+    '''
+    # 加载配置文件
     configuration_maps = {
         'module_to_stage_map': None,
         'stage_to_rank_map': None,
@@ -201,7 +302,17 @@ def main():
         configuration_maps['stage_to_rank_map'] = {
             int(k): v for (k, v) in configuration_maps['stage_to_rank_map'].items()}
         configuration_maps['stage_to_depth_map'] = json_config_file.get("stage_to_depth_map", None)
-
+    '''
+    0x04 runtime
+    为了演示，我们这里用如下参数进行启动 main_with_runtime.py。
+    
+    --module translation.models.gnmt.gpus=4 --data_dir=wmt16_ende_data_bpe_clean   
+        --config_path pipedream-pipedream/runtime/translation/models/gnmt/gpus=4/mp_conf.json 
+        --local_rank 3 --rank 3 --master_addr 127.0.0.1
+    
+    在main函数中用如下办法构建了Runtime。Runtime是执行引擎，提供一个统一的、可扩展的基础设施层。
+    '''
+    # 构建一个 StageRuntime
     r = runtime.StageRuntime(
         model=model, distributed_backend=args.distributed_backend,
         fp16=args.fp16, loss_scale=args.loss_scale,
@@ -245,15 +356,16 @@ def main():
         best_prec1 = checkpoint['best_prec1']
         r.load_state_dict(checkpoint['state_dict'])
         print("=> loaded checkpoint '{}' (epoch {})"
-                .format(checkpoint_file_path, checkpoint['epoch']))
+              .format(checkpoint_file_path, checkpoint['epoch']))
 
     # TODO: make this configurable by args
+    # 建立 optimizer
     use_adam_optimizer = True
     if use_adam_optimizer:
         optimizer = adam.AdamWithWeightStashing(
             modules=r.modules(), master_parameters=r.master_parameters,
             model_parameters=r.model_parameters, loss_scale=args.loss_scale,
-            num_versions=num_versions, lr=args.lr, betas=(0.9,0.999),
+            num_versions=num_versions, lr=args.lr, betas=(0.9, 0.999),
             weight_decay=args.weight_decay, verbose_freq=args.verbose_frequency,
             macrobatch=args.macrobatch)
     else:
@@ -268,6 +380,7 @@ def main():
 
     cudnn.benchmark = True
 
+    # 加载 dataset
     train_dataset = LazyParallelDataset(
         src_fname=os.path.join(args.data_dir, config.SRC_TRAIN_FNAME),
         tgt_fname=os.path.join(args.data_dir, config.TGT_TRAIN_FNAME),
@@ -311,8 +424,9 @@ def main():
     # if checkpoint is loaded, start by running validation
     if args.resume:
         assert args.start_epoch > 0
-        validate(val_loader, r, args.start_epoch-1)
+        validate(val_loader, r, args.start_epoch - 1)
 
+    # 进行训练，保存checkpoint
     for epoch in range(args.start_epoch, args.epochs):
         if distributed_sampler:
             train_loader.sampler.set_epoch(epoch)
@@ -338,7 +452,7 @@ def main():
                     'arch': args.arch,
                     'state_dict': r.state_dict(),
                     'best_prec1': best_prec1,
-                    'optimizer' : optimizer.state_dict(),
+                    'optimizer': optimizer.state_dict(),
                     'tokenizer': tokenizer.get_state()
                 }, args.checkpoint_dir, r.stage, epoch)
 

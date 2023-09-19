@@ -1,0 +1,386 @@
+深度学习流水线并行 PipeDream(4)--- 运行时引擎
+https://www.cnblogs.com/rossiXYZ/p/15253496.html
+
+目录
+[源码解析] 深度学习流水线并行 PipeDream(4)--- 运行时引擎
+0x00 摘要
+0x01 前言
+1.1 前文回顾
+1.2 运行时系统
+1.2.1 PyTorch 的特点
+1.2.2 PyTorch RPC
+Distributed RPC framework APIs [Now Stable]
+1.2.3 PipeDream的特性
+1.2.4 结合起来
+0x02 使用
+2.1 如何调用
+2.2 总体逻辑
+0x03 加载模型
+3.1 模型文件
+3.2 加载
+3.3 构建模型
+3.4 输入输出
+3.5 配置
+0x04 runtime
+4.1 StageRuntime
+4.2 初始化
+4.2.1 设置tag
+4.2.2 配置map
+4.2.3 找到自己的配置
+4.2.3.1 num_ranks
+4.2.3.2 rank_in_stage
+4.2.4 设置通信模块
+4.2.5 设置生产者和消费者
+4.2.6 设置module
+4.2.7 设置group
+4.2.8 设置数据并行
+4.2.9 初始化通信函数
+4.3 功能函数
+4.3.1 receive_tensors_forward
+4.3.2 send_tensors_forward
+4.3.3 receive_tensors_backward
+4.3.4 send_tensors_backward
+4.3.5 run_ack
+0xFF 参考
+0x00 摘要
+在前文中，我们介绍了PipeDream的总体架构，Profile阶段，计算分区阶段和模型转换阶段，本文我们介绍运行时执行引擎，这是一个统一基础设施层。
+
+流水线并行其他文章链接如下:
+
+[源码解析] 深度学习流水线并行Gpipe(1)---流水线基本实现
+
+[源码解析] 深度学习流水线并行GPipe (2) ----- 梯度累积
+
+[源码解析] 深度学习流水线并行 GPipe(3) ----重计算
+
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
+
+[源码解析] 深度学习流水线并行 PipeDream(2)--- 计算分区
+
+[源码解析] 深度学习流水线并行 PipeDream(3)--- 转换模型
+
+0x01 前言
+1.1 前文回顾
+在前文，我们经历了三个阶段：profile，计算分区，模型转换，目前就得到了若干python文件&配置文件。
+PipeDream 加载这些文件之后，就可以进行训练。
+
+所以从本文开始，我们介绍训练所需要的各种支撑系统，比如运行时执行引擎。主要是看看一个深度学习训练运行时应该包括什么功能。
+
+1.2 运行时系统
+结合之前的分析和我们先思考为何要实现一个运行时，以及针对深度学习（流水线并行）需要实现什么功能。
+
+1.2.1 PyTorch 的特点
+首先看看PyTorch 的特点：
+
+    PyTorch 本身实现了 autograd 功能，这样反向传播就做到了自动微分。
+
+    在分布式数据并行实现上，PyTorch 实现了 DDP 功能。
+
+    在分布式模型并行等方面，PyTorch 也提供了 RPC 功能作为支撑基础。
+    但是，RPC功能是在 PyTorch 1.5 版本中引入的，时间是2020-06-12。
+
+    针对 DDP 和 RPC，PyTorch 也相应实现了 distributed.autograd 功能，对用户屏蔽了大量分布式细节，
+    让用户对分布式训练尽量无感（我们后文会有专门系列来分析PyTorch的分布式）。
+
+1.2.2 PyTorch RPC
+RPC 功能是在 PyTorch 1.5 版本中正式引入的，时间是2020-06-12，具体如下。
+
+Distributed RPC framework APIs [Now Stable]
+The torch.distributed.rpc package aims at supporting a wide range of
+distributed training paradigms that do not fit into DistributedDataParallel.
+Examples include parameter server training, distributed model parallelism, and distributed pipeline parallelism.
+Features in the torch.distributed.rpc package can be categorized into four main sets of APIs.
+
+    The RPC API allows running a function on a specified destination worker with given arguments and fetches
+    the return value or creates a distributed reference to the return value.
+
+    The RRef (Remote REFerence) serves as a reference to an object on another worker.
+    A worker holding an RRef can explicitly request copies of the object,
+    and it can also share the light-weight RRef with other workers without worrying about reference counting.
+    This is especially useful when multiple workers need to repeatedly
+    access different versions of the same remote object.
+
+    With Distributed Autograd, applications can automatically compute gradients
+    even if a model is split on multiple workers using RPC.
+    This is achieved by stitching together local autograd graphs at RPC boundaries in the forward pass and
+    reaching out to participants to transparently launch local autograd in the backward pass.
+
+    The Distributed Optimizer uses gradients computed by Distributed Autograd to update model parameters.
+    Its constructor takes a local optimizer (e.g., SGD, Adagrad, etc.) and a list of parameter RRefs,
+    and its step() function automatically uses the local optimizer
+    to update parameters on all distinct RRef owner workers.
+
+但是 PipeDream 论文是在 2019 年发布，这就意味着 PipeDream无法精准利用 PyTorch RPC，只能自己实现通信逻辑，即对计算图的支撑。
+
+1.2.3 PipeDream的特性
+其次看看PipeDream的特性：
+
+    PipeDream是把模型并行，数据并行结合在一起，实现了流水线并行。
+
+    PipeDream实际上是把一个完整的深度训练模型拆分开来，各个子模型（子图）分别放在不同节点之上。
+
+1.2.4 结合起来
+综合以上两点，这就意味着，对于PipeDream来说，单纯的 DDP，模型并行和 autograd 功能无法满足我们的需求，必须结合起来使用。
+
+PipeDream需要自己实现至少：
+
+    如何在多个阶段（节点）之间进行通信，这可能会使用到 PyTorch RPC 功能，
+    但是因为开始时候没有稳定版本，只能自己实现一个分布式计算图，这样就用到了 PyTorch distributed 的 P2P 功能。
+
+    因为通信需要，所以自己管理每个阶段（节点）的发送、接受rank，就是配置和管理各个阶段（节点）的生产者，消费者。
+    这样也意味着需要找到每个阶段（节点）的输入，输出。
+
+    因为 P2P 通信功能需要，所以需要给每个张量配置一个唯一的标识（对应下文的tag）。
+
+    如何在单个阶段（若干节点）上进行数据并行，这应该会用到 PyTorch DDP 功能。
+
+    因为用到数据并行，所以需要自己管理每个阶段的并行数目。
+
+    因为需要结合模型并行和数据并行，所以需要自己管理进程工作组。
+
+    因为在不同节点（机器）上运行，所以每个机器独立运行训练脚本时候，需要对自己训练job进行独立配置。
+
+所以，下面我们结合这些功能点，做具体分析。
+
+
+....
+
+
+0x03 加载模型
+我们先来看看如何加载模型。
+
+3.1 模型文件
+模型文件在上文中生成，所以这里加载模型文件，我们以 ../translation/models/gnmt/gpus=4/ 下的模型文件为例。
+
+这里的__init__文件如下：
+
+    from .gnmt import GNMTSplit
+    from .stage0 import Stage0
+    from .stage1 import Stage1
+    from .stage2 import Stage2
+    from .stage3 import Stage3
+
+    def arch():
+        return "gnmt"
+
+    def model(criterion):
+        return [
+            (Stage0(), ["input0", "input1"], ["out2", "out1"]),
+            (Stage1(), ["out2", "input1", "input2", "out1"], ["out3", "out7"]),
+            (Stage2(), ["out3", "out7"], ["out8", "out9", "out10"]),
+            (Stage3(), ["out8", "out9", "out10"], ["out12"]),
+            (criterion, ["out12"], ["loss"])
+        ]
+
+    def full_model():
+        return GNMTSplit()
+
+具体每个 item 的格式如下：
+
+    (stage, inputs, outputs)
+
+所以就需要按照这个格式来加载。
+
+3.2 加载
+具体加载方法如下：
+
+# create stages of the model
+module = importlib.import_module(args.module)
+args.arch = module.arch()
+得到module如下：
+
+    module = {module} <module 'translation.models.gnmt.gpus=4' from '../translation/models/gnmt/gpus=4/__init__.py'>
+     GNMTSplit = {type} <class 'translation.models.gnmt.gpus=4.gnmt.GNMTSplit'>
+     Stage0 = {type} <class 'translation.models.gnmt.gpus=4.stage0.Stage0'>
+     Stage1 = {type} <class 'translation.models.gnmt.gpus=4.stage1.Stage1'>
+     Stage2 = {type} <class 'translation.models.gnmt.gpus=4.stage2.Stage2'>
+     Stage3 = {type} <class 'translation.models.gnmt.gpus=4.stage3.Stage3'>
+     gnmt = {module} <module 'translation.models.gnmt.gpus=4.gnmt' from '../translation/models/gnmt/gpus=4/gnmt.py'>
+     stage0 = {module} <module 'translation.models.gnmt.gpus=4.stage0' from '../translation/models/gnmt/gpus=4/stage0.py'>
+     stage1 = {module} <module 'translation.models.gnmt.gpus=4.stage1' from '../translation/models/gnmt/gpus=4/stage1.py'>
+     stage2 = {module} <module 'translation.models.gnmt.gpus=4.stage2' from '../translation/models/gnmt/gpus=4/stage2.py'>
+     stage3 = {module} <module 'translation.models.gnmt.gpus=4.stage3' from '../translation/models/gnmt/gpus=4/stage3.py'>
+
+3.3 构建模型
+接下来会依据模块来构建模型。
+    model = module.model(criterion)
+这里 criterion 是 LabelSmoothing() 。
+在 model(criterion) 调用之中，会逐一调用 Stage0() ~ Stage3()，构建每个层。
+比如Stage3 会调用到 __init__ 函数。
+
+    class Stage3(torch.nn.Module):
+        def __init__(self):
+            super(Stage3, self).__init__()
+            self.layer5 = torch.nn.LSTM(2048, 1024)
+            self.layer8 = Classifier(1024, 32320)
+
+得到了model，具体如下。
+
+model = {list: 5}
+
+0 = {tuple: 3}
+ 0 = {Stage0} Stage0(\n  (layer4): Embedding(32320, 1024, padding_idx=0)\n  (layer5): EmuBidirLSTM(\n    (bidir): LSTM(1024, 1024, bidirectional=True)\n    (layer1): LSTM(1024, 1024)\n    (layer2): LSTM(1024, 1024)\n  )\n  (layer6): Dropout(p=0.2, inplace=False)\n  (layer7): LSTM(2048, 1024)\n  (layer9): Dropout(p=0.2, inplace=False)\n)
+ 1 = {list: 2} ['input0', 'input1']
+ 2 = {list: 2} ['out2', 'out1']
+ __len__ = {int} 3
+
+1 = {tuple: 3}
+ 0 = {Stage1} Stage1(\n  (layer6): LSTM(1024, 1024)\n  (layer9): Embedding(32320, 1024, padding_idx=0)\n  (layer11): Dropout(p=0.2, inplace=False)\n  (layer12): LSTM(1024, 1024)\n  (layer15): RecurrentAttention(\n    (rnn): LSTM(1024, 1024)\n    (attn): BahdanauAttention(\n      (linear_q): Linear(in_features=1024, out_features=1024, bias=False)\n      (linear_k): Linear(in_features=1024, out_features=1024, bias=False)\n      (dropout): Dropout(p=0, inplace=False)\n    )\n    (dropout): Dropout(p=0, inplace=False)\n  )\n)
+ 1 = {list: 4} ['out2', 'input1', 'input2', 'out1']
+ 2 = {list: 2} ['out3', 'out7']
+ __len__ = {int} 3
+
+2 = {tuple: 3}
+ 0 = {Stage2} Stage2(\n  (layer7): Dropout(p=0.2, inplace=False)\n  (layer9): LSTM(2048, 1024)\n  (layer11): Dropout(p=0.2, inplace=False)\n  (layer13): LSTM(2048, 1024)\n  (layer16): Dropout(p=0.2, inplace=False)\n)
+ 1 = {list: 2} ['out3', 'out7']
+ 2 = {list: 3} ['out8', 'out9', 'out10']
+ __len__ = {int} 3
+
+3 = {tuple: 3}
+ 0 = {Stage3} Stage3(\n  (layer5): LSTM(2048, 1024)\n  (layer8): Classifier(\n    (classifier): Linear(in_features=1024, out_features=32320, bias=True)\n  )\n)
+ 1 = {list: 3} ['out8', 'out9', 'out10']
+ 2 = {list: 1} ['out12']
+ __len__ = {int} 3
+
+4 = {tuple: 3} (LabelSmoothing(), ['out12'], ['loss'])
+ 0 = {LabelSmoothing} LabelSmoothing()
+ 1 = {list: 1} ['out12']
+ 2 = {list: 1} ['loss']
+ __len__ = {int} 3
+
+__len__ = {int} 5
+3.4 输入输出
+模型加载完之后，开始设置输入和输出，具体逻辑是：
+
+    依据参数进行配置
+
+    遍历模型的每个层（跳过最后loss层）做如下操作：
+
+        遍历每层的输入，构建输入张量。
+
+        通过调用stage对应的forward函数，构建出输出。
+
+        遍历每层的输出，设置类型。
+
+        构建张量形状。
+
+需要注意的是每个子模块的格式如下：
+
+    (
+    Stage0(),
+    ["input0", "input1"], # 输入
+    ["out2", "out1"] # 输出
+    )
+
+代码注释如下：
+    # 依据参数进行配置比如输入大小，batch size等
+    input_size = [args.max_length_train, args.batch_size]
+.....
+
+
+4.2 初始化
+初始化函数代码很长，我们逐段进行分析。
+
+4.2.1 设置tag
+在函数开始，遍历模型每一层的输入和输出，设置 tensor_tag，就是给每一个tensor一个独立唯一的tag，
+tag经过层层传递，最终会用到 distributed_c10d.py 中的 recv 函数。
+tensor_tag 会在通信过程中被使用，被p2p用作确定标识。
+===yknote这是pytorch的代码！！！！！
+    def recv(tensor,
+             src=None,
+             group=None,
+             tag=0):
+        """
+        Receives a tensor synchronously.
+
+        Args:
+            tensor (Tensor): Tensor to fill with received data.
+            src (int, optional): Source rank. Will receive from any
+                process if unspecified.
+            group (ProcessGroup, optional): The process group to work on. If None,
+                the default process group will be used.
+            tag (int, optional): Tag to match recv with remote send
+
+        Returns:
+            Sender rank
+            -1, if not part of the group
+
+        """
+        _check_single_tensor(tensor, "tensor")
+        if _rank_not_in_group(group):
+            return -1
+
+        if group is None:
+            pg = _get_default_group()
+        else:
+            pg = group
+
+        if src is None:
+            work = pg.recv_anysource([tensor], tag)
+            work.wait()
+            src_rank = work._source_rank()
+            if group is None or group is GroupMember.WORLD:
+                return src_rank
+            else:
+                return _get_global_rank(pg, src_rank)
+        else:
+            if group is None or group is GroupMember.WORLD:
+                pg.recv([tensor], src, tag).wait()
+            else:
+                group_src_rank = _get_group_rank(pg, src)
+                pg.recv([tensor], group_src_rank, tag).wait()
+            return src
+具体设置 tag 的代码如下：
+    def initialize(self, model, inputs_module_destinations,
+                   configuration_maps, master_addr, rank,
+                   local_rank, num_ranks_in_server):
+。。。。
+
+
+4.2.2 配置map
+回忆一下配置文件中的部分定义：
+
+    module_to_stage_map 就是 ：本模型被划分为哪些stage。
+    stage_to_rank_map 就是 ：每个stage对应了哪些rank，rank 就代表了具体的 worker 进程，比如本stage被几个rank进行数据并行。
+
+我们给出一个样例，对应的文件内容如下：
+
+    {
+        "module_to_stage_map": [0, 1, 2, 2],
+        "stage_to_rank_map": {"0": [0, 1, 4, 5, 8, 9, 12, 13], "1": [2, 6, 10, 14], "2": [3, 7, 11, 15]}
+    }
+
+针对我们本文的模型，配置文件如下：
+
+    {
+        "module_to_stage_map": [0, 1, 2, 3, 3],
+        "stage_to_rank_map": {"0": [0], "1": [1], "2": [2], "3": [3]}
+    }
+
+加载到内存中为：
+
+    module_to_stage_map = {list: 5} [0, 1, 2, 3, 3]
+    rank_to_stage_map = {dict: 4} {0: 0, 1: 1, 2: 2, 3: 3}
+
+因为有时候也需要反过来查找，所以程序接下来进行反向配置，得到如下。
+
+stage_to_module_map = {defaultdict: 4}
+ default_factory = {type} <class 'list'>
+ 0 = {list: 1} [0]
+ 1 = {list: 1} [1]
+ 2 = {list: 1} [2]
+ 3 = {list: 2} [3, 4]
+ __len__ = {int} 4
+stage_to_rank_map = {dict: 4}
+ 0 = {list: 1} [0]
+ 1 = {list: 1} [1]
+ 2 = {list: 1} [2]
+ 3 = {list: 1} [3]
+ __len__ = {int} 4
+
+
+ .....
+
+
+ 0xFF 参考
+https://pytorch.org/docs/stable/rpc.html
