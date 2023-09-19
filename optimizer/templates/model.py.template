@@ -1,6 +1,10 @@
 import torch
 %(import_statements)s
-
+'''
+3.2.2 模版文件
+上面代码中，是依据应用模版文件生成模型，模版文件位于：optimizer/templates/model.py.template，内容如下，
+具体就是使用转换过程中生成的python语句对模版文件进行填充。
+'''
 class %(module_name)s(torch.nn.Module):
     def __init__(self):
         super(%(module_name)s, self).__init__()

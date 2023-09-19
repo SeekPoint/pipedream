@@ -122,17 +122,52 @@ class Graph(object):
                 if in_node.node_id not in visited:
                     queue.append(in_node)
 
+    '''
+    partition_graph 对应的代码具体逻辑为：
+    
+        遍历节点，找到所有的stage。
+        得到所有stage id之后，按照stage id来构建子图，具体就是针对给定的stage，在所有节点中查找对应stage的节点，构建一个子图。
+    '''
     def partition_graph(self):
         stage_ids = set()
+
+        # 遍历节点，找到所有的stage
         for node_id in self.nodes:
             stage_ids.add(self.nodes[node_id].stage_id)
+
+        # stage_ids 为 {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
         if len(stage_ids) == 1:
             return [self.copy()]
         subgraphs = []
+
+        # 按照stage构建子图
         for stage_id in stage_ids:
             subgraphs.append(self.partition_graph_helper(stage_id))
         return subgraphs
+    '''
+    得到子图为：
 
+        subgraphs = {list: 10} 
+        
+         00 = {Graph} 
+           'node4' = {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000 -- stage_id=0
+           'node1' = {Node} node1 -- Input0 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000 -- stage_id=0
+           'node2' = {Node} node2 -- Input1 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000 -- stage_id=0
+           'node3' = {Node} node3 -- Input2 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000 -- stage_id=0
+           __len__ = {int} 4
+            
+         01 = {Graph} node5 
+          edges = {dict: 1} {'node5': [<graph.graph.Node object at 0x7f9c5be91438>]}
+          in_edges = {dict: 1} {'node6': [<graph.graph.Node object at 0x7f9c5be91470>]}
+          nodes = {dict: 2} {'node5': <graph.graph.Node object at 0x7f9c5be91470>, 'node6': <graph.graph.Node object at 0x7f9c5be91438>}
+           'node5' = {Node} node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000 -- stage_id=1
+           'node6' = {Node} node6 -- Dropout(p=0.2) -- forward_compute_time=0.077, backward_compute_time=0.196, activation_size=12582912.0, parameter_size=0.000 -- stage_id=1
+           __len__ = {int} 2
+            
+        ......
+    '''
+
+    # 针对给定的stage，在所有节点中查找对应stage的节点，构建一个子图
     def partition_graph_helper(self, stage_id):
         subgraph = Graph()
         for node1_id in self.nodes:

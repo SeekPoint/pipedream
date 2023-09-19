@@ -1,0 +1,183 @@
+深度学习流水线并行 PipeDream(3)--- 转换模型
+
+https://www.cnblogs.com/rossiXYZ/p/15230891.html
+
+目录
+[源码解析] 深度学习流水线并行 PipeDream(3)--- 转换模型
+0x00 摘要
+0x01 前言
+1.1 改进
+1.2 前文回顾
+0x02 合成模型
+2.1 主体逻辑
+2.2 支撑逻辑
+0x03 模型转换
+3.1 分离子图
+3.2 转换模型
+3.2.1 转换Module
+3.2.2 模版文件
+3.2.3 生成文件
+3.3 融合模型
+3.3.1 main函数逻辑
+3.3.2 融合模型
+3.3.3 输出
+3.4 init 文件
+3.5 配置文件
+3.5.1 代码逻辑
+3.5.2 数据并行
+3.5.3 模型并行
+0x04 总结
+0xFF 参考
+
+
+0x00 摘要
+在前文中，我们介绍了PipeDream的总体架构，Profile阶段和计算分区阶段。本文我们介绍模型转换阶段。
+
+流水线并行其他文章链接如下:
+
+[源码解析] 深度学习流水线并行Gpipe(1)---流水线基本实现
+
+[源码解析] 深度学习流水线并行GPipe (2) ----- 梯度累积
+
+[源码解析] 深度学习流水线并行 GPipe(3) ----重计算
+
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
+
+[源码解析] 深度学习流水线并行 PipeDream(2)--- 计算分区
+
+0x01 前言
+1.1 改进
+模型转换阶段是PipeDream相对于GPipe的一个改进，让我们分析一下。
+
+    GPipe的流水线划分（模型具体层的分配），可以理解为是一个程序运行前的，介于动态和静态之间的一个预处理，对于用户来说不是透明的。
+
+    PipeDream的模型层分配，则是依据profile结果把同一个stage的所有层打包统一生成一个Pytorch模型python文件，也属于预处理。
+    但是无疑比GPipe更方便清晰，用户也可以二次手动调整。
+
+PipeDream 模型转换的基本思路是：
+
+    从模型文件之中加载模型DAG图进入内存。
+
+    按照stage对图进行处理，把整体DAG图分离开来。
+    因为在前文中，已经把模型的层分配到了各个Stage之上，所以本阶段就是使用 partition_graph 把每个Stage所包含的层分离出来。
+
+    对个每个stage的子图来应用模板文件，每个stage子图生成一个python文件。
+    在main函数之中，对于每个子图，将其转换为一个Pytorch Module，就对应着一个python文件。
+    就是说，每一层都是这个 Module 的一个子模块。
+
+    融合模型，把各个Stage的子图合并起来，生成总体的模型文件。
+    前一部分中，生成了若干module的python文件，都对应了一个subgraph，本节的作用就是把这些子图合并成一个大图，
+    对应到python代码，就是生成一个新python文件，里面把各个subgraph的python 引入，生成一个总module文件。
+
+    输出一个 init 文件，这样更容易处理。
+
+    生成相关配置文件，比如数据并行配置文件，模型并行配置文件。
+
+具体如下图：
+
+Model File +-----------+  +-----------+  +------------+  +-----------+  +------------+  +----------+
+           |  Edge 1   |  | Edge 2    |  |  Edge 3    |  |  Edge 4   |  |   Edge 5   |  | Edge 6   |
+           +-----------+  +-----------+  +------------+  +-----------+  +------------+  +----------+
+           +-----------+  +-----------+  +------------+  +-----------+  +------------+
+           |Node 1     |  |Node 2     |  | Node 3     |  |Node 4     |  |Node 5      |
+           |   stage 1 |  |    stage 1|  |     stage 2|  |    stage 2|  |     stage 3|
+           +-----+-----+  +------+----+  +--------+---+  +-+---------+  +------+-----+
+                 |               |                |        |                   |
+                 |               |                |        |                   |
++---------------------------------------------------------------------------------------------------+
+                 |               |                |        |                   |
+Subgraphs        +----+     +----+                |        |                   |
+                      |     |                     |        |                   |
+                      v     v                     v        v                   v
+                 +----+-----+-----+          +----+--------+-+         +-------+-------+
+                 | Subgraph 1     |          | Subgraph 2    |         | Subgraph 3    |
+                 |                |          |               |         |               |
+                 |      Node 1    |          |      Node 3   |         |       Node 5  |
+                 |                |          |               |         |               |
+                 |      Node 2    |          |      Node 4   |         |               |
+                 |                |          |               |         |               |
+                 +-------+--------+          +---------+-----+         +-------+-------+
+                         |                             |                       |
+                         |                             |                       |
++---------------------------------------------------------------------------------------------------+
+                         |                             |                       |
+Modules                  |                             |                       |
+                         v                             v                       v
+                 +-------+-------+             +-------+-------+        +------+--------+
+                 |               |             |               |        |               |
+                 |   Module 1    |             |  Module 2     |        |  Module 3     |
+                 |               |             |               |        |               |
+                 +-------+-------+             +-------+-------+        +--------+------+
+                         |                             |                         |
+                         |                             |                         |
++----------------------------------------------------------------------------------------------------+
+                         |                             |                         |
+Python files             |                             |                         |
+                         v                             v                         v
+                   +-----+------+               +------+------+           +------+------+
+                   |            |               |             |           |             |
+                   | stage1.py  |               |  stage2.py  |           |  stage3.py  |
+                   |            |               |             |           |             |
+                   +-----+------+               +------+------+           +------+------+
+                         |                             |                         |
+                         |                             |                         |
+                         |                             |                         |
+                         +-------------------------------------------------------+
+                                                       |
+                                                       |
+                                                       v
+                                              +--------+--------+
+                                              |    gnmt.py      |
+                                              |                 |
+                                              +-----------------+
+手机如下：  15.png
+
+
+
+1.2 前文回顾
+为了更好的说明，我们要回忆下上文的输出。
+
+输出文件如下（摘录部分），可以看到，输出文件依然和profile输出文件类似，是一个图。
+关键之处在于给每一个节点加上了stage，本文环节就要把这个输出文件换成成一个Pytorch模型，或者说是一套python文件。
+
+    node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000 -- stage_id=0
+    node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000 -- stage_id=1
+    node6 -- Dropout(p=0.2) -- forward_compute_time=0.077, backward_compute_time=0.196, activation_size=12582912.0, parameter_size=0.000 -- stage_id=1
+    node7 -- LSTM(2048, 1024) -- forward_compute_time=3.190, backward_compute_time=5.348, activation_size=6553600.0, parameter_size=50364416.000 -- stage_id=2
+    node8 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+    node10 -- Dropout(p=0.2) -- forward_compute_time=0.064, backward_compute_time=0.128, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+    node11 -- LSTM(1024, 1024) -- forward_compute_time=2.491, backward_compute_time=4.203, activation_size=6553600.0, parameter_size=33587200.000 -- stage_id=3
+    node12 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+    node14 -- Add -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=4
+    node15 -- Dropout(p=0.2) -- forward_compute_time=0.059, backward_compute_time=0.121, activation_size=6291456.0, parameter_size=0.000 -- stage_id=4
+    node16 -- LSTM(1024, 1024) -- forward_compute_time=2.492, backward_compute_time=4.201, activation_size=6553600.0, parameter_size=33587200.000 -- stage_id=4
+    node17 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=5
+    node19 -- Add -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=5
+        node1 -- node4
+        node4 -- node5
+        node2 -- node5
+        node5 -- node6
+        node6 -- node7
+        node7 -- node8
+        node8 -- node10
+        node10 -- node11
+        node11 -- node12
+        node12 -- node14
+        node8 -- node14
+        node14 -- node15
+        node15 -- node16
+        node16 -- node17
+        node17 -- node19
+
+...
+
+
+0x04 总结
+最终结果如下，就是把模型图转换成每个stage自己对应的python文件，
+最后再汇总打包成一个总的python文件，用户可以直接使用。
+16.png
+
+0xFF 参考
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
+
+[源码解析] 深度学习流水线并行 PipeDream(2)--- 计算分区
