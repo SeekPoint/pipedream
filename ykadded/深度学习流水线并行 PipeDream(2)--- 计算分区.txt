@@ -1,0 +1,595 @@
+深度学习流水线并行 PipeDream(2)--- 计算分区
+https://www.cnblogs.com/rossiXYZ/p/15223869.html
+
+目录
+[源码解析] 深度学习流水线并行 PipeDream(2)--- 计算分区
+0x00 摘要
+0x01 前言
+1.1 Profile文件
+1.2 总体思路
+0x02 图相关
+2.1 Graph
+2.2 构建图
+2.3 反链
+0x03 构建反链
+3.1 main函数入口
+3.2 增强反链
+3.3 后续反链
+3.4 总体构建
+3.5 拓扑排序
+3.6 总结
+0x04 计算分区
+4.1 main函数的逻辑
+4.2 动态规划
+4.2.1 总体思路
+4.2.2 具体分析
+4.2.3 区别
+0x05 分析分区
+5.1 main函数逻辑
+5.2 分析阶段
+5.3 设定stage
+5.4 总结
+0x06 输出
+0xFF 参考
+
+0x00 摘要
+在前文中，我们介绍了PipeDream的总体架构和Profile阶段，本文我们继续介绍计算分区阶段。
+其功能是：依据profile结果确定所有层的运行时间，然后使用动态规划对模型进行划分，将模型划分为不同的stage，以及得到每个stage的replication数。
+计算结果具体如下图所示：  08.png
+
+流水线并行其他文章链接如下:
+
+[源码解析] 深度学习流水线并行Gpipe(1)---流水线基本实现
+
+[源码解析] 深度学习流水线并行GPipe (2) ----- 梯度累积
+
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
+
+0x01 前言
+1.1 Profile文件
+我们首先看看profile文件 profiler/translation/profiles/gnmt/graph.txt 内容，这里只是做摘录。
+
+node1 -- Input0 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000
+node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000
+node2 -- Input1 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000
+node6 -- Dropout(p=0.2) -- forward_compute_time=0.077, backward_compute_time=0.196, activation_size=12582912.0, parameter_size=0.000
+node7 -- LSTM(2048, 1024) -- forward_compute_time=3.190, backward_compute_time=5.348, activation_size=[6291456.0; 131072.0; 131072.0], parameter_size=50364416.000
+node8 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000
+node9 -- __getitem__(1) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=131072.0, parameter_size=0.000
+node10 -- Dropout(p=0.2) -- forward_compute_time=0.064, backward_compute_time=0.128, activation_size=6291456.0, parameter_size=0.000
+node11 -- LSTM(1024, 1024) -- forward_compute_time=2.491, backward_compute_time=4.203, activation_size=[6291456.0; 131072.0; 131072.0], parameter_size=33587200.000
+node12 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000
+node13 -- __getitem__(1) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=131072.0, parameter_size=0.000
+node14 -- Add -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000
+node15 -- Dropout(p=0.2) -- forward_compute_time=0.059, backward_compute_time=0.121, activation_size=6291456.0, parameter_size=0.000
+node16 -- LSTM(1024, 1024) -- forward_compute_time=2.492, backward_compute_time=4.201, activation_size=[6291456.0; 131072.0; 131072.0], parameter_size=33587200.000
+node17 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000
+......
+	node1 -- node4
+	node4 -- node5
+	node2 -- node5
+	node5 -- node6
+	node6 -- node7
+	node7 -- node8
+	node7 -- node9
+	node8 -- node10
+	node10 -- node11
+	node11 -- node12
+	node11 -- node13
+	node12 -- node14
+	node8 -- node14
+	node14 -- node15
+	node15 -- node16
+	node16 -- node17
+	node16 -- node18
+	node17 -- node19
+	node14 -- node19
+......
+1.2 总体思路
+在前文我们也提到了几个挑战，其中有：
+
+    如何高效划分流水线。
+
+        模型特质和硬件拓扑会降低效率。分配算法也必须考虑模型特质和硬件拓扑。
+
+        机器间的过度通信会降低硬件效率。
+
+    如何防止流水线瓶颈。
+
+        由木桶原理我们可以知道，一个流水线管道的吞吐量由这个流水线上最慢环节的吞吐量决定。
+        所以需要确保流水线中所有阶段都大致花费相同的计算时间，否则最慢的阶段将会成为整个流水线的瓶颈。
+
+因此当跨机器将层划分为不同的阶段时，PipeDream的自动划分算法必须确保每个阶段大致执行相同的总工作量。
+同时还必须确保各阶段之间通信的数据量尽可能小，以避免通信中断。
+
+PipeDream的自动划分算法总体目标是输出一个平衡的管道，算法如下：
+
+    将DNN层划分为多个阶段，以便每个阶段以大致相同的速率完成，即花费大致相同的计算时间。
+
+    尝试以拓扑感知的方式尽量减少worker之间的通信（例如，如果可能，向更高带宽的链路发送较大的输出）。
+
+    因为DNN并不总可以在可用的workers做平均分配，为了进一步改进负载平衡，PipeDream允许复制一个stage，
+    即在这个stage上使用多个worker进行数据并行。
+
+这个划分问题等价于最小化流水线的最慢阶段所花费的时间，并且具有最优子问题属性：
+在给定worker工作量前提下，吞吐量最大化的流水线由一系列子流水线构成，其中每一个子流水线针对较小worker工作量来最大化自己的输出。
+因此PipeDream使用动态规划来寻找最优解。
+
+这里给出对应的架构图如下： 09.png
+我们下面先看看计算分区之前的准备工作：图相关工作和构建反链。
+
+0x02 图相关
+图的定义位于 graph/graph.py 文件之中，主要数据结构有两个：Graph 和 Node。
+...
+我们打印出运行时看看，可以发现 Graph 的具体情况。
+
+gr = {Graph}
+ # 边
+ edges = {dict: 39}
+  'node1' = {list: 1}
+   0 = {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+  'node4' = {list: 1}
+   0 = {Node} node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000
+   ......
+
+ # 输入边
+ in_edges = {dict: 44}
+  'node4' = {list: 1}
+   0 = {Node} node1 -- Input0 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000
+  'node5' = {list: 2}
+   0 = {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+   1 = {Node} node2 -- Input1 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000
+   ......
+
+ # 节点
+ nodes = {dict: 48}
+  'node1' = {Node} node1 -- Input0 -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=0.0, parameter_size=0.000
+  'node4' = {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+  'node5' = {Node} node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000
+ ......
+
+# 前置节点
+_predecessors = {dict: 36}
+ 'node4' = {set: 0} set()
+  __len__ = {int} 0
+ 'node5' = {set: 1} {<graph.graph.Node object at 0x7fb055e4bf28>}
+  {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+  __len__ = {int} 1
+ 'node6' = {set: 2} {<graph.graph.Node object at 0x7fb055e4bf98>, <graph.graph.Node object at 0x7fb055e4bf28>}
+  {Node} node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000
+  {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+  __len__ = {int} 2
+ 'node7' = {set: 3} {<graph.graph.Node object at 0x7fb055e4bf98>, <graph.graph.Node object at 0x7fb055e4bf28>, <graph.graph.Node object at 0x7fb055e670f0>}
+  {Node} node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000
+  {Node} node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000
+  {Node} node6 -- Dropout(p=0.2) -- forward_compute_time=0.077, backward_compute_time=0.196, activation_size=12582912.0, parameter_size=0.000
+  __len__ = {int} 3
+
+ # 其他变量
+  _antichain_dag = {NoneType} None
+  _augmented_antichains = {dict: 0} {}
+  _deaugmented_augmented_antichains = {dict: 0} {}
+  _next_antichains = {dict: 0} {}
+  _successors = {dict: 0} {}
+
+
+....
+
+0x03 构建反链
+因为本节概念比较绕，所以我们先提前剧透。
+
+寻找某节点后续反链的目的就是找到下一个图分割点 A（可能是若干node的组合），
+为了确定 A 的运行时间（或者其他信息），我们需要找到 A 的增强反链。
+
+此处具体代码位于optimizer_graph_hierarchical.py 文件。
+
+我们利用如下逻辑来演示：
+
++-------+       +-------+
+| node1 |       | node2 |
++---+---+       +---+---+
+    |               |
+    |               |
+    |               |
+    v               v
++---+---+       +---+---+        +-------+        +-------+
+| node4 +-----> | node5 +------> | node6 +------->+ node7 |
++-------+       +-------+        +-------+        +-+-+---+
+                                                    | |
+                                                    | |
+                                      +-------------+ |
+                                      |               |
+                                      v               v
+                                 +----+--+        +---+---+
+                                 | node9 |        | node8 +-----+
+                                 +-------+        +---+---+     |
+                                                      |         |
+                    +---------------------------------+         |
+                    |                                           |
+                    v                                           |
+               +----+---+       +--------+        +--------+    |
+               | node10 +-----> | node11 +------> | node12 |    |
+               +--------+       +---+----+        +----+---+    |
+                                    |                  |        |
+                                    |                  |        |
+                                    v                  v        |
+                                +---+----+        +----+---+    |
+                                | node13 |        | node14 +<---+
+                                +--------+        +-+----+-+
+                                                    |    |
+                                             +------+    +---+
+                                             |               |
+                                             v               v
+                                        +----+---+        +--+-----+
+                                        | node15 |        | node19 |
+                                        +--------+        +--------+
+
+
+
+
+4.2 动态规划
+4.2.1 总体思路
+这里有一些动态规划的算法需要分析。
+
+分割算法试图减少模型的整体训练时间。对于流水线系统，这个问题等价于最小化流水线最慢阶段所花费的时间。
+该问题具有最优化子问题性质；在给定机器计数的情况下，使吞吐量最大化的管道由子管道组成，这些子管道分别使自己这个子管道的吞吐量最大化。
+因此，我们可以用动态规划来寻找这个问题的最优解。
+
+分区算法获取profiling步骤的输出，并计算：
+
+    1）将层划分为多个阶段，
+
+    2）每个阶段的复制因子（worker数），
+
+    3）保持训练管道繁忙的最佳动态小批量数。
+
+PipeDream的优化器假设机器拓扑是分层的，并且可以被组织成多个级别，如下图所示。一个级别内的带宽是相同的，而跨级别的带宽是不同的。
+我们假设 k 级由 mk 个 k-1层组件构成 ，这些组件通过带宽为Bk的链路连接。
+在下图中，m2=2，m1=4。此外，我们定义m0为1。即 4 个 m0 构成一个 m1, 2个 m1 构成一个 m2。
+
+层 0 就是绿色矩形，代表最底层的计算设备，
+比如GPU，4个GPU构成了一个层1（虚线矩形，代表一个服务器），2个层1构成了一个层2（就是下图全部模块）。
+
+PipeDream的优化器从最低层到最高层逐步解决动态规划问题。
+直观地说，这个过程在服务器中找到最佳分区，然后使用这些分区在服务器之间最优地分割模型。
+10.png
+
+
+4.2.2 具体分析
+假设 A(j, m) 表示使用m台机器在第1层和第j层之间的最佳管道中，最慢阶段所用的时间。
+
+我们算法的目标是找到 A(N,M) 和相应的划分。让T( i → j,m) 表示跨越层 i 到 j 的单级所用的时间，此时间在m台机器上复制。
+
+11.png
+12.png
+
+其中：
+
+    max中的左项是在此阶段中所有层的总计算时间，右项是此阶段中所有层的总通信时间。
+
+    因为计算和通信可以重叠，所以不需要相加，直接取最大数值。
+
+    由1到j的由m个机器组成的最佳流水线可以是单个阶段复制m次，也可以由多个阶段组成。
+
+当最佳管道包含多个阶段时，
+它可以被分解成一个最优的子管道（由从1到 i 的 由m − m′ 个机器组成）和后续的一个单独阶段（由i+1到j 的被 m' 个机器复制组成）。
+因此，利用最优子问题的性质，我们得到
+
+13.png
+14.png
+
+
+其中，max中：
+
+    第一项是第1层和第i层之间的最优子管道（由m-m'个机器组成）的最慢阶段所用的时间。
+
+    第二项是在层 i 和 i + 1 之间传递激活和梯度所用的时间。
+
+    第三项是最后单个阶段的时间（由 m' 个数据并行的机器组成）。
+
+我们具体看看如何计算，假设一个图逻辑如下：
+
+                       +----------------+
++-----+                |                +--------+
+|     +------------->  |  k[m_prime]    |        |          +-----+
+|  i  |                |                |        +--------->+     |
+|     +----+           +----------------+                   |  j  |
++-----+    |                                      +-------->+     |
+           |           +----------------+         |         +-----+
+           |           |                |         |
+           +-------->  |  k[m-m_prime]  +---------+
+                       |                |
+                       +----------------+
+在 (A [i] [k] [m-m_prime] [0], last_stage_time, output_transfer_time, input_transfer_time ）之中选一个最大的：
+
+    A [i] [k] [m-m_prime] [0] ：i 到 k 之间的计算时间，是已经计算好的子问题。
+
+    last_stage_time ：last_stage_time 是 (k 到 j 的计算时间) + 传输时间。
+
+        其中compute_times[k + 1] [j] 是k 到 j 的计算时间，compute_times[k + 1] 就对应了k的输出。
+
+        传输时间是依据k 到 j 的下一阶段参数大小（parameter_sizes[k + 1 ] [j]）计算得出。
+
+        即：last_stage_time = compute_times[k + 1] +（parameter_sizes[k + 1 ] [j]）
+
+    input_transfer_time ：使用 k 的输出激活大小计算出来的传输时间（就是 j 的输入）。
+
+    output_transfer_time ：使用 j 的输出激活大小计算出来的传输时间。
+
+因为传输和计算是可以重叠的，所以可以这样取最大数值。
+
+最后得到的 A 就是动态规划优化的结果，其中每一个元素 A[i][j][m] 是个三元组 (min_pipeline_time, optimal_split, optimal_num_machines)。 A[i][j][m] 表示节点 i 到 节点 j 之间的计算结果。三元组就是 (最小流水线时间，i 到 j 之间那个最佳分割点，最优机器数目)。
+
+大致阶段如下图所示：
+
+                                                       +----------------+
+                                                       | i              |
+                                                       |                |
+                                                       |                |
+                                                       +--+------+------+
+                                                          |      |
+                                                          |      +----------+
+                                  A[i][k][m+m_prime][0]   |                 |
+                                                          |                 |
+                                                          v                 v
+                                        +-----------------+-------+    +----+--------+
+                                        | k[m-m_prime]            |    | k[m_prime]  |
+                                        |                         |    |             |
+last_stage_time = compute_times[k+1][j] |                         |    |             |
+            + (parameter_sizes[k+1][j]) | output_activation_sizes |    |             |
+                                        |                         |    |             |
+                                        |                         |    |             |
+                                        +-----------------+-------+    +-----+-------+
+                                     input_transfer_time  |                  |
+                                                          |      +-----------+
+                                                          |      |
+                                                          |      |
+                                                          v      v
+                                             +------------+------+------+
+                                             | j                        |
+                                             |                          |
+                                             |                          |
+                                             |                          |
+                                             |  output_activation_sizes |
+                                             |                          |
+                                             +------------------+-------+
+                                          output_transfer_time  |
+                                                                |
+                                                                |
+                                                                v
+具体代码如下：
+
+def compute_partitioning
+.....
+
+
+
+
+.....
+
+5.2 分析阶段
+分析阶段具体可以参见下面注释。
+我们还是用样例进行说明。
+def analyze_partitioning(A, states
+.....
+
+这里是从后面进行分割，举例分析如下，这里设定了总机器数目为10：
+
+回忆在计算分区之中，A[i][j][m] = (min_pipeline_time, optimal_split, optimal_num_machines)，
+optimal_split = (k, m-m_prime) 是一个本阶段优化点。
+
+所以在本函数之中，start = 0, end = 99，所以 metadata 为A[0][99][10]，
+即 (0.01903199999999998, (95, 8), 1)，next_split = (95, 8)，prev_split = end - 1 = 98。
+
+next_split 就是下一个分割点，splits 是目前的分割序列。
+
+第一轮while循环：
+
+因为next_split = (95, 8)，所以 splits = append(next_split[0]+1) = [96]，
+因此计算 states[prev_split-1] - states[next_split[0]] = state[97] - state[95]。
+这样把0~99分成了 0 ～95 和 96 ~ 99。
+
+然后 prev_split = 96，去找A[ 0 ] [ 95] [8] 得到 meta = (0.019031999999999993, (78, 7), 1)，next_split = (78, 7)。
+
+所以下一轮从78这个分割点开始分割。
+
+第二轮while循环：
+
+因为next_split = (78, 7)，所以 splits = [96, 79]，这就是新的分割序列。
+因此计算 states[96-1] - states[next_split[0]] = state[96] - state[78]。
+这样就使用 splits = [96, 79] 把0~99分成了 0 ～78，79 ~ 95 和 96 ~ 99。
+
+然后 prev_split =79，去找A[ 0 ] [ 78 ] [ 7 ] 得到 meta = (0.011081, (48, 6), 1)，next_split = (48, 6)。
+
+所以下一轮从 48 这个分割点开始分割，以此类推。
+
+while循环之后，得到 splits = [96, 79, 49, 15, 12, 7, 5, 3, 1]。
+
+于是下面代码需要把顺序调整过来。
+
+    prev_split = start
+    splits.reverse()
+    splits.append(end)
+    replication_factors.append(num_machines_used)
+    replication_factors.reverse()
+
+得到：splits = { 1，3，5，7，12，15，49，79，96 }。然后加上 end = 99。
+
+最后返回 splits[:-1]，即返回 { 1，3，5，7，12，15，49，79，96 }，去掉刚刚添加的end。
+
+而依据 { 1，3，5，7，12，15，49，79，96 } 得到的最终分割序列 是
+[(0, 1), (1, 3), (3, 5), (5, 7), (7, 12), (12, 15), (15, 49), (49, 79), (79, 96), (96, 99)]，
+这个列表会在后续"设定stage"之中会用到。
+
+5.3 设定stage
+目前我们得到了一个理想分割序列，但是事情没有结束，我们回忆一下分区算法的目的：
+依据profile结果确定所有层的运行时间，然后使用动态规划对模型进行划分，将模型划分为不同的stage，以及得到每个stage的replication数。
+
+所以，分析的最终目的是给模型的每一个子层分配一个stage，如果某些子层属于同一个stage，这些子层最终就被分配到同一个worker（节点）上执行。
+
+因为这里涉及到多个子网，所以我们依然用实例来分析。
+
+如果分成了两个子网，假设：
+
+    all_num_machines = [5,5]
+    network_bandwidths = [800000000, 1000000000]
+
+初始化 splits = [0,99]。
+第一轮 while 中，i = 1，
+对于 splits 结果[(0, 99)] 遍历，每一段应用analyze_partitioning，得到 partial_splits 为 [3, 6, 30, 75, 99]。
+最后，splits 更新为：[(0, 3), (3, 6), (6, 30), (30, 75), (75, 99)]。
+此时不会设置stage_id。
+
+第二轮 while 中，i = 0，
+对于第一轮的 splits 结果 [(0, 3), (3, 6), (6, 30), (30, 75), (75, 99)] 进行遍历，对于这里的每一段也应用 analyze_partitioning，
+比如对 (0,3) 应用analyze_partitioning，对 (3,6) 应用 analyze_partitioning，对(6,30) 也应用 analyze_partitioning，......，
+最后得到新的 partial_splits 为 [1, 2, 3, 4, 5, 6, 8, 10, 13, 28, 30, 45, 49, 51, 75, 79, 96, 99]。
+最后，splits 更新为：
+[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 8), (8, 10), (10, 13), (13, 28),
+(28, 30), (30, 45), (45, 49), (49, 51), (51, 75), (75, 79), (79, 96), (96, 99)]。
+
+这个列表就是理想分割序列。在此轮中，得到了partial_splits之后，会遍历 for split in partial_splits:
+然后对于每一个 split，利用
+
+    states[split-1].antichain 获取其增强反链的所有前置节点，给这些节点打上 split 对应的 stage_id。
+
+回忆一下增强反链的意义：
+
+    每个节点的增强反链包括：本身节点 + 部分前序节点。
+    对于增强反链概念，可以理解为：对于节点 A，他只有把节点 Z 一起考虑，才能唯一确定自己节点的运行时间。
+
+所以，对于 split = 1，1 - 1 = 0，于是就得到 states[0].antichain ，就是 'node4'，
+那么 'node4' 自己被打上了一个stage_id=0，说明 'node4' 被分到了一个 "与stage_id=0 所对应" 的 worker 节点上训练。
+
+如果有疑问，我们回忆一下state如何构建，就是有序的 "节点组合"。
+
+    antichain_gr = gr.antichain_dag()
+    states = antichain_gr.topological_sort()
+具体如下。
+
+    states = {list: 99}
+     00 = {AntichainNode} antichain_0 -- ['node4'] # states[0].antichain
+     01 = {AntichainNode} antichain_1 -- ['node5']
+     02 = {AntichainNode} antichain_2 -- ['node6']
+     03 = {AntichainNode} antichain_3 -- ['node7']
+     04 = {AntichainNode} antichain_4 -- ['node8']
+     05 = {AntichainNode} antichain_5 -- ['node8', 'node10']
+     06 = {AntichainNode} antichain_7 -- ['node8', 'node11']
+     07 = {AntichainNode} antichain_10 -- ['node8', 'node12']
+     08 = {AntichainNode} antichain_6 -- ['node14']
+     09 = {AntichainNode} antichain_8 -- ['node14', 'node15']
+     10 = {AntichainNode} antichain_11 -- ['node14', 'node16']
+     11 = {AntichainNode} antichain_13 -- ['node14', 'node17']
+     12 = {AntichainNode} antichain_9 -- ['node19']
+     13 = {AntichainNode} antichain_12 -- ['node20', 'node23']
+     14 = {AntichainNode} antichain_18 -- ['node23', 'node20', 'node26']
+     15 = {AntichainNode} antichain_17 -- ['node23', 'node20', 'node24']
+     16 = {AntichainNode} antichain_32 -- ['node23', 'node20', 'node28']
+     17 = {AntichainNode} antichain_31 -- ['node23', 'node20', 'node26', 'node24']
+     18 = {AntichainNode} antichain_63 -- ['node23', 'node20', 'node26', 'node28']
+     19 = {AntichainNode} antichain_33 -- ['node20', 'node26', 'node29']
+     20 = {AntichainNode} antichain_16 -- ['node20', 'node43', 'node23']
+     21 = {AntichainNode} antichain_30 -- ['node23', 'node20', 'node43', 'node26']
+     22 = {AntichainNode} antichain_29 -- ['node23', 'node20', 'node43', 'node24']
+     23 = {AntichainNode} antichain_59 -- ['node23', 'node20', 'node43', 'node28']
+
+设定stage 具体代码如下：
+
+splits = [(0, len(states))]
+i = len(all_As) - 1
+while i >= 0:
+    new_splits = []
+    stage_id = 0
+    for (start, end) in splits:
+        partial_splits = \
+            analyze_partitioning(all_As[i], states, start, end,
+                                 network_bandwidths[i], all_num_machines[i],
+                                 activation_compression_ratio,
+                                 print_configuration, verbose)
+        start_point = start
+        for split in partial_splits: # 遍历这个偏序列表
+            new_splits.append((start_point, split))
+            if i == 0: # 最终的while
+                # 针对每个节点，找到每个节点的所有反链
+                predecessors = gr.all_predecessors(states[split-1].antichain)
+                for predecessor in predecessors:
+                    if predecessor.stage_id is None:
+                        predecessor.set_stage_id(stage_id) # 打上stage id
+            start_point = split
+            stage_id += 1
+        new_splits.append((start_point, end))
+        if i == 0: # 最终的while
+            predecessors = gr.all_predecessors(states[end-1].antichain)
+            for predecessor in predecessors:
+                if predecessor.stage_id is None:
+                    predecessor.set_stage_id(stage_id) # 打上stage id
+        stage_id += 1
+    splits = new_splits
+    i -= 1
+
+
+5.4 总结
+我们总结一下计算分区和分析分区所做的工作：
+
+    反链DAG图已经被分割成若干状态（states），每个状态很重要的一个属性是其增强反链。
+    states 就是对增强反链进行拓扑排序之后的结果，按照这个顺序进行训练是符合逻辑的。
+
+    compute_partitioning 是使用动态规划算法对于这些 states 状态得出一个最优化结果，
+    但是这个计算分区只是得到了一个动态规划优化结果，需要在analyze_partitioning之中进行分析划分之后，赋予到各个层（stage）。
+
+    analyze_partitioning 是利用动态规划算法的最优化结果来做具体分区，
+    排序后得到了一个偏序结果，就是理想分割序列。
+
+    依据 analyze_partitioning 的结果，给模型的每一个子层分配一个stage，
+    如果某些子层属于同一个stage，这些子层最终就被分配到同一个worker（节点）上执行。
+
+
+
+0x06 输出
+
+输出文件如下（摘录部分），可以看到，关键之处在于给每一个节点加上了stage，具体如何使用我们将在下一篇进行分析。比如：
+
+stage_id=0 对应的是 node4。
+
+stage_id=1 对应的是 node5，node6。
+
+stage_id=2 对应的是 node7。
+
+stage_id=3 对应的是 node8，node10，node11，node12。
+
+......
+
+具体如下：
+
+node4 -- Embedding(32320, 1024, padding_idx=0) -- forward_compute_time=0.073, backward_compute_time=6.949, activation_size=6291456.0, parameter_size=132382720.000 -- stage_id=0
+node5 -- EmuBidirLSTM(  (bidir): LSTM(1024, 1024, bidirectional=True)  (layer1): LSTM(1024, 1024)  (layer2): LSTM(1024, 1024)) -- forward_compute_time=5.247, backward_compute_time=0.016, activation_size=12582912.0, parameter_size=67174400.000 -- stage_id=1
+node6 -- Dropout(p=0.2) -- forward_compute_time=0.077, backward_compute_time=0.196, activation_size=12582912.0, parameter_size=0.000 -- stage_id=1
+node7 -- LSTM(2048, 1024) -- forward_compute_time=3.190, backward_compute_time=5.348, activation_size=6553600.0, parameter_size=50364416.000 -- stage_id=2
+node8 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+node10 -- Dropout(p=0.2) -- forward_compute_time=0.064, backward_compute_time=0.128, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+node11 -- LSTM(1024, 1024) -- forward_compute_time=2.491, backward_compute_time=4.203, activation_size=6553600.0, parameter_size=33587200.000 -- stage_id=3
+node12 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=3
+node14 -- Add -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=4
+node15 -- Dropout(p=0.2) -- forward_compute_time=0.059, backward_compute_time=0.121, activation_size=6291456.0, parameter_size=0.000 -- stage_id=4
+node16 -- LSTM(1024, 1024) -- forward_compute_time=2.492, backward_compute_time=4.201, activation_size=6553600.0, parameter_size=33587200.000 -- stage_id=4
+node17 -- __getitem__(0) -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=5
+node19 -- Add -- forward_compute_time=0.000, backward_compute_time=0.000, activation_size=6291456.0, parameter_size=0.000 -- stage_id=5
+	node1 -- node4
+	node4 -- node5
+	node2 -- node5
+	node5 -- node6
+	node6 -- node7
+	node7 -- node8
+	node8 -- node10
+	node10 -- node11
+	node11 -- node12
+	node12 -- node14
+	node8 -- node14
+	node14 -- node15
+	node15 -- node16
+	node16 -- node17
+	node17 -- node19
+
+0xFF 参考
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
