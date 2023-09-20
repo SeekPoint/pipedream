@@ -9,3 +9,24 @@ https://zhuanlan.zhihu.com/p/576673548
 
 https://github.com/microsoft/DeepSpeed/issues/1110
 Details about pipeline parallelism implementation in DeepSpeed
+
+
+https://www.microsoft.com/en-us/research/people/amar/
+Amar Phanishayee
+Senior Principal Researcher
+
+
+
+https://www.microsoft.com/en-us/research/project/fiddle/
+Project Fiddle: Fast and Efficient Infrastructure for Distributed Deep Learning
+
+The goal of Project Fiddle is to build efficient systems infrastructure for very fast distributed DNN training. Our goal is to support 100x more efficient training. To achieve this goal, we take a broad view of training: from a single GPU, to multiple GPUs on a machine, all the way to training on large multi-machines clusters. Our innovations cut across the systems stack: the memory subsystem, structuring parallel computation across GPUs and machines, and interconnects between GPUs and across machines.
+
+Our work so far has targeted many different parts of the systems stack (organized as different sub-projects)
+
+Gist: In Gist, we ask: how far can we push the limits of single-GPU training? Specifically, we explore training larger networks on a single GPU by slashing down training memory footprint.
+PipeDream: Unlike other big-data workloads, DNN training is not naïvely parallelizable because one has to strike a balance between hardware and statistical efficiency. Time to achieve the desired accuracy is what matters. We have designed a new way to systematically parallelize DNN computation to efficiently scale training by combining model parallelism, data parallelism, and pipelining.
+Blink: There are exciting advances in inter-GPU interconnects such as NVLink on a single machine and Infiniband when using GPU-direct RDMA. But these advances bring with them heterogeneity as a challenge for data-transfer protocol developers. Blink is a library targeted to speed up inter-GPU communication in parallel training; it shields developers from interconnect heterogeneity while autogenerating transfer schedules for collectives that maximize interconnect link usage.
+CoorDL, CheckFreq: Optimized data loading and checkpointing libraries for DNN training.
+Fast, fair, and heterogeneity-aware multi-tenant cluster schedulers (Synergy, Gavel, Themis).
+Our work in Fiddle is grounded in rigorous profiling and benchmarking, while building helpful tools along the way. Our profiling work spans single-GPU training [TBD (Training Benchmark for DNNs)(opens in new tab)], multi-GPU training, and cluster-wide profiling and characterization across multiple jobs (Philly Traces(opens in new tab)). We have also built tools, such as Daydream, that given a model and a deployment scenario, can efficiently explore the efficacy of potential solutions without implementing or running them.
