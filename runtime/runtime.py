@@ -840,18 +840,22 @@ rank_in_stage 会传递给 Comm 模块。
             self.comm_handler.increment_messaging_index(
                 sending=True)
 
+    '''
+    3.3 前向传播
+    以下是 StageRuntime 类的 run_forward 方法 和 _run_forward 方法，这两个方法完成了前向传播。
+    '''
     def run_forward(self, recompute_step=False):
         """Run forward pass.
         """
         # Receive tensors from previous worker.
-        self.receive_tensors_forward()
+        self.receive_tensors_forward() # 接受上一阶段的张量
         tensors = self.tensors[-1]
 
         # Run forward pass.
-        self._run_forward(tensors)
+        self._run_forward(tensors) # 进行本阶段前向传播计算
 
         # Send tensors forward.
-        self.send_tensors_forward()
+        self.send_tensors_forward()  # 发送给下一阶段
         if self.verbose_freq > 0 and self.forward_minibatch_id % self.verbose_freq == 0:
             self.forward_stats.print_stats()
         self.forward_stats.reset_stats()
@@ -860,12 +864,16 @@ rank_in_stage 会传递给 Comm 模块。
     def _run_forward(self, tensors):
         # Perform forward pass through model (self.modules_with_dependencies already
         # has modules in topological order).
+        # 得到module和对应的输入，输出
         modules = self.modules_with_dependencies.modules()
         all_input_names = self.modules_with_dependencies.all_input_names()
         all_output_names = self.modules_with_dependencies.all_output_names()
+
+        # 遍历模块
         for i, (module, input_names, output_names) in \
                 enumerate(zip(modules, all_input_names, all_output_names)):
             if i == (len(modules) - 1) and self.is_criterion:
+                # 如果是计算损失
                 # If layer is criterion (loss).
                 if self.model_type == SPEECH_TO_TEXT:
                     output = tensors["output"].transpose(0, 1).float()
@@ -880,6 +888,7 @@ rank_in_stage 会传递给 Comm 模块。
                                       for input_name in input_names]
                     module_outputs = [sum(module_outputs)]
             else:
+                # 中间层
                 # If layer is non-criterion.
                 module_outputs = module(*[tensors[input_name]
                                           for input_name in input_names])
@@ -887,10 +896,12 @@ rank_in_stage 会传递给 Comm 模块。
                     module_outputs = (module_outputs,)
                 module_outputs = list(module_outputs)
 
+            # 把计算结果放入tensors之中，这样后续就知道如何发送
             for (output_name, module_output) in zip(output_names, module_outputs):
                 tensors[output_name] = module_output
 
         self.output = tensors[input_names[0]]
+        # 如果是最后阶段，则做处理
         if self.is_criterion and self.model_type == TRANSLATION:
             loss_per_batch = tensors[output_names[0]] * tensors[self.criterion_input_name].size(1)
             loss_per_token = loss_per_batch / tensors["target_length"][0].item()
@@ -900,9 +911,14 @@ rank_in_stage 会传递给 Comm 模块。
         else:
             self.loss = 1
 
+    '''
+    3.4 反向传播
+    运行引擎的 run_backward 完成了后向计算。
+    '''
     def run_backward(self):
         # Receive input gradients needed for backward pass.
-        self.receive_tensors_backward()
+        self.receive_tensors_backward()   # 从反向计算图上一层接受梯度
+
         # Backward pass through modules in reverse order.
         inputs = {}
         outputs = {}
@@ -913,6 +929,7 @@ rank_in_stage 会传递给 Comm 模块。
         all_input_names_set = set()
         all_output_names_set = set()
 
+        # 得到module和对应的输入，输出
         modules = self.modules_with_dependencies.modules()
         all_input_names = self.modules_with_dependencies.all_input_names()
         all_output_names = self.modules_with_dependencies.all_output_names()
@@ -936,6 +953,7 @@ rank_in_stage 会传递给 Comm 模块。
                     if output_name not in self.gradients:
                         output_gradients[output_name] = None
                     else:
+                        # 计算梯度记录在这里
                         output_gradients[output_name] = self.gradients[output_name]
                     if tensors[output_name].requires_grad:
                         outputs[output_name] = tensors[output_name]
@@ -958,6 +976,8 @@ rank_in_stage 会传递给 Comm 模块。
             outputs["loss"] *= self.loss_scale
 
         # Perform backward pass.
+        # 进行反向传播，output_gradients
+        # outputs 就是要计算梯度的张量，output_gradients就是计算出来的梯度
         torch.autograd.backward(tuple([outputs[output_name] for output_name in outputs]),
                                 grad_tensors=tuple([output_gradients[output_name]
                                                     for output_name in outputs]))
@@ -972,11 +992,83 @@ rank_in_stage 会传递给 Comm 模块。
                 self.gradients[input_name] = input_gradients[input_name]
 
         # Send output gradients.
-        self.send_tensors_backward()
+        self.send_tensors_backward()  # 发送梯度（self.gradients）给反向图的下一层
         if self.verbose_freq > 0 and self.backward_minibatch_id % self.verbose_freq == 0:
             self.backward_stats.print_stats()
         self.backward_stats.reset_stats()
         self.backward_minibatch_id += 1
+        '''
+我们借助前文的图，再加深一下印象。
+
+发送逻辑：
+
+ StageRuntime            CommunicationHandler              send_helper_thread
+
+      +                           +                                 +
+      |                           |                                 |
+      | 1                         |                                 |
+      v                           |                                 |
+ run_backward                     |                                 |
+      |                           |                                 |
+      | 2                         |                                 |
+      |                           |                    wait on backward_send_queues
+      v                  3        v                                 |
+send_tensors_backward +--------> send                               |
+                                  |                                 |
+                                  |                                 |
+                                  |  4                              |
+                                  v               5                 v
+               backward_send_queues.add(tensor) +----> tensor = queue.remove()
+                                                notify              |
+                                                                    |
+                                                                    | 6
+                                                                    v
+                                                                  _send
+                                                                    |
+                                                                    | 7
+                                                                    |
+                                                                    v
+                                                                 dist.send
+接受逻辑：
+
+    StageRuntime             CommunicationHandler           recv_helper_thread
+          +                            +                            +
+          |                            |                            |
+          | 1                          |                            |
+          |                            |                            | 4
+          v                            |                            v
+    run_backward                       |                         _recv
+          |                            |                            |
+          |                            |                            |
+          |                            |                            | 5
+          |                            |                            |
+          | 2                          |                            v
+          |                            |                  dist.recv / dist.broadcast
+          |                            |                            |
+          v                  3         v                            |
+receive_tensors_backward +--------->  recv                          |
+          +                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            v                            |
+          |                 backward_receive_queues.remove()        |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |               wait on backward_receive_queues           |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                 6          v
+          |                  backward_receive_queues <-------+ queue.add(tensor)
+          |                            |               notify
+          |                            |  7
+          v                  3 return  |
+gradients[output_name] <---------------+
+        
+        '''
 
     def num_tokens(self):
         return self.tensors[-1]["target_length"][0].item()

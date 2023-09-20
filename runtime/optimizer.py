@@ -15,7 +15,11 @@ class Version:
 
     def incr(self):
         return Version(version=self.version+1)
-
+'''
+3.5 Weight Stashing
+Weight Stashing 是由OptimizerWithWeightStashing实现的。
+下面省略了很多次要代码，训练时候调用了 load_old_params 和 load_new_params。
+'''
 class OptimizerWithWeightStashing(torch.optim.Optimizer):
     """Wrapper class that adds weight stashing to a vanilla torch.optim.Optimizer.
 
@@ -59,7 +63,7 @@ class OptimizerWithWeightStashing(torch.optim.Optimizer):
         self.queue = deque(maxlen=self.num_versions)
         for i in range(self.num_versions):
             self.queue.append(self.get_params(clone=True))
-        self.buffered_state_dicts = self.queue[0][0]
+        self.buffered_state_dicts = self.queue[0][0]   # stash weght变量
 
     def get_params(self, clone):
         if clone:
@@ -109,13 +113,13 @@ class OptimizerWithWeightStashing(torch.optim.Optimizer):
 
     def load_old_params(self):
         if self.num_versions > 1:
-            self.set_params(*self.queue[0])
+            self.set_params(*self.queue[0])  #找到最初的旧weight
 
     def load_new_params(self):
         if self.num_versions > 1:
-            self.set_params(*self.queue[-1])
+            self.set_params(*self.queue[-1]) # 加载最新的weight
 
-    def zero_grad(self):
+    def zero_grad(self): # 用来reset
         if self.batch_counter % self.update_interval == 0:
             self.base_optimizer.zero_grad()
 
@@ -126,6 +130,7 @@ class OptimizerWithWeightStashing(torch.optim.Optimizer):
             closure (callable, optional): A closure that reevaluates the model
                                           and returns the loss.
         """
+        # 每 update_interval个 steps更新一次梯度
         # Update the gradient every `update_interval` steps.
         if self.batch_counter % self.update_interval != self.update_interval - 1:
             self.batch_counter += 1
@@ -153,10 +158,10 @@ class OptimizerWithWeightStashing(torch.optim.Optimizer):
             import apex.fp16_utils as fp16_utils
             fp16_utils.master_params_to_model_params(self.model_parameters,
                                                      self.master_parameters)
-        self.latest_version = self.latest_version.incr()
+        self.latest_version = self.latest_version.incr() # 因为多训练了一步，所以增加版本号
         if self.num_versions > 1:
             self.buffered_state_dicts = self.queue[0][0]
-            self.queue.append(self.get_params(clone=False))
+            self.queue.append(self.get_params(clone=False))  # 把新的变量存进去
 
         if log_timing:
             print("Optimizer step took: %.3f" % (time.time() - start_time))

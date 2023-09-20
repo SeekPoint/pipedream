@@ -131,6 +131,10 @@ class SyntheticDataset(torch.utils.data.dataset.Dataset):
     def __len__(self):
         return self.length
 '''
+0x03 代码
+3.1 总体代码
+我们用 runtime/translation/main_with_runtime.py 来分析。
+
 2.2 总体逻辑
 使用 runtime 的总体逻辑以如下文件为例 ：runtime/translation/main_with_runtime.py。主要逻辑是：
 
@@ -145,13 +149,12 @@ class SyntheticDataset(torch.utils.data.dataset.Dataset):
     构建输出值张量类型
     加载配置文件
     构建一个 StageRuntime
-    建立 optimizer
+    建立 optimizer， 这里 optimizer，使用了AdamWithWeightStashing 或者 SGDWithWeightStashing，所以就是使用了 weight stashing。
     加载 dataset
     进行训练，保存checkpoint
     
 总体代码如下：
 '''
-
 
 def main():
     # 解析输入参数
@@ -359,7 +362,7 @@ eval_tensor_shapes = {dict: 13} {
               .format(checkpoint_file_path, checkpoint['epoch']))
 
     # TODO: make this configurable by args
-    # 建立 optimizer
+    # 建立 optimizer，使用了AdamWithWeightStashing 或者 SGDWithWeightStashing
     use_adam_optimizer = True
     if use_adam_optimizer:
         optimizer = adam.AdamWithWeightStashing(
@@ -456,6 +459,24 @@ eval_tensor_shapes = {dict: 13} {
                     'tokenizer': tokenizer.get_state()
                 }, args.checkpoint_dir, r.stage, epoch)
 
+'''
+3.2 训练函数
+05.png
+
+我们下面看看训练函数 train 代码
+
+    首先进入启动热身阶段，需要一直执行到 输出完成第一个小批次的前向传播，对应上图的 Startup State。
+    然后开始交替执行后续小批次的前向传播和后向传播，从此时开始，进入到上图的 Steady State，在每个阶段之中，对于每一个小批次：
+        实施前向传播，目的是把minibatch推送到下游worker。这就是 1F。
+        如果是最后阶段，则更新损失。
+        梯度清零。
+        加载保存的权重。
+        后向传播。这就是 1B。
+        恢复最新权重。目前在本step内，就完成了 1F1B。
+        进行下一次step。
+    最后是剩余的后向传播，对应着热身阶段的前向传播。
+'''
+
 
 def train(train_loader, r, optimizer, epoch):
     batch_time = AverageMeter()
@@ -484,23 +505,25 @@ def train(train_loader, r, optimizer, epoch):
         print("Running training for %d minibatches" % n)
 
     # start num_warmup_minibatches forward passes
+    # 启动热身阶段，需要一直执行到 输出完成第一个小批次的前向传播，对应上图的Start State。
     for i in range(num_warmup_minibatches):
-        r.run_forward()
+        r.run_forward()  # 前向传播，就是1F
 
+    # 开始交替执行后续小批次的前向传播和后向传播，从此时开始，进入到上图的 Steady State。
     for i in range(n - num_warmup_minibatches):
         # perform forward pass
-        r.run_forward()
+        r.run_forward()  # 前向传播，就是1F
 
-        if is_last_stage():
+        if is_last_stage():  # 最后阶段
             # measure accuracy and record loss
             output, target, loss, num_tokens = r.output, r.target, r.loss.item(), r.num_tokens()
-            losses.update(loss, num_tokens)
+            losses.update(loss, num_tokens)  # 更新损失
 
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
             epoch_time = (end - epoch_start_time) / 3600.0
-            full_epoch_time = (epoch_time / float(i+1)) * float(n)
+            full_epoch_time = (epoch_time / float(i + 1)) * float(n)
 
             if i % args.print_freq == 0:
                 print('Epoch: [{0}][{1}/{2}]\t'
@@ -508,43 +531,50 @@ def train(train_loader, r, optimizer, epoch):
                       'Epoch time [hr]: {epoch_time:.3f} ({full_epoch_time:.3f})\t'
                       'Memory: {memory:.3f} ({cached_memory:.3f})\t'
                       'Loss: {loss.val:.4f} ({loss.avg:.4f})\t'.format(
-                       epoch, i, n, batch_time=batch_time,
-                       epoch_time=epoch_time, full_epoch_time=full_epoch_time,
-                       loss=losses, # top1=top1, top5=top5,
-                       memory=(float(torch.cuda.memory_allocated()) / 10**9),
-                       cached_memory=(float(torch.cuda.memory_cached()) / 10**9)))
-                import sys; sys.stdout.flush()
+                    epoch, i, n, batch_time=batch_time,
+                    epoch_time=epoch_time, full_epoch_time=full_epoch_time,
+                    loss=losses,  # top1=top1, top5=top5,
+                    memory=(float(torch.cuda.memory_allocated()) / 10 ** 9),
+                    cached_memory=(float(torch.cuda.memory_cached()) / 10 ** 9)))
+                import sys;
+                sys.stdout.flush()
         else:
             if i % args.print_freq == 0:
                 print('Epoch: [{0}][{1}/{2}]\tMemory: {memory:.3f} ({cached_memory:.3f})'.format(
-                       epoch, i, n, memory=(float(torch.cuda.memory_allocated()) / 10**9),
-                       cached_memory=(float(torch.cuda.memory_cached()) / 10**9)))
-                import sys; sys.stdout.flush()
+                    epoch, i, n, memory=(float(torch.cuda.memory_allocated()) / 10 ** 9),
+                    cached_memory=(float(torch.cuda.memory_cached()) / 10 ** 9)))
+                import sys;
+                sys.stdout.flush()
 
         # perform backward pass
         if args.fp16:
-            r.zero_grad()
+            r.zero_grad()  # 梯度清零
         else:
-            optimizer.zero_grad()
-        optimizer.load_old_params()
+            optimizer.zero_grad()  # 梯度清零
 
-        r.run_backward()
-        optimizer.load_new_params()
-        optimizer.step()
+        optimizer.load_old_params()  # 加载 stash weight
+
+        r.run_backward()  # 后向传播，就是1B
+
+        optimizer.load_new_params()  # 恢复新的weight
+
+        optimizer.step()  # 下一次训练，同时更新参数
 
     # finish remaining backward passes
+    # 最后剩余的后向传播，对应着热身阶段的前向传播
     for i in range(num_warmup_minibatches):
         optimizer.zero_grad()
-        optimizer.load_old_params()
-        r.run_backward()
-        optimizer.load_new_params()
-        optimizer.step()
+        optimizer.load_old_params()  # 加载 stash weight
+        r.run_backward()  # 后向传播，就是1B
+        optimizer.load_new_params()  # 恢复新的weight
+        optimizer.step()  # 下一次训练
 
     # wait for all helper threads to complete
     r.wait()
 
     print("Epoch %d: %.3f seconds" % (epoch, time.time() - epoch_start_time))
     print("Epoch start time: %.3f, epoch end time: %.3f" % (epoch_start_time, time.time()))
+    #上面参数的 r 是 StageRuntime 类型，所以我们看看其中的run_forward和run_backward。
 
 
 def validate(val_loader, r, epoch):
