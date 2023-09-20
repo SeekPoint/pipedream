@@ -1,0 +1,182 @@
+深度学习流水线并行 PipeDream(5)--- 通信模块
+https://www.cnblogs.com/rossiXYZ/p/15261170.html
+
+
+目录
+[源码解析] 深度学习流水线并行 PipeDream(5)--- 通信模块
+0x00 摘要
+0x01 前言
+0x02 类定义
+0x03 构建
+3.1 初始化
+3.2 创建queue
+3.3 前向后向顺序
+3.3.1 建立顺序
+3.3.2 获取消息序列
+3.3.3 增加消息序列
+3.4 建立进程组
+3.4.1 设计
+3.4.2 代码
+3.5 启动助手线程
+3.5.1 建立线程
+3.5.2 线程主函数
+3.5.3 构建参数
+0x04 功能函数
+4.1 发送逻辑
+4.2 接受逻辑
+4.3 recv
+4.4 send
+4.5 _recv
+4.6 _send
+0xFF 参考
+0x00 摘要
+在前文中，我们介绍了PipeDream的总体架构，Profile阶段，计算分区阶段，模型转换阶段和运行时引擎，本文我们介绍PipeDream 的通信模块，通信模块是引擎的基础，同时也是PyTorch DDP，P2P 如何使用的一个万花筒和完美示例。
+
+流水线并行其他文章链接如下:
+
+[源码解析] 深度学习流水线并行Gpipe(1)---流水线基本实现
+
+[源码解析] 深度学习流水线并行GPipe (2) ----- 梯度累积
+
+[源码解析] 深度学习流水线并行 GPipe(3) ----重计算
+
+[源码解析] 深度学习流水线并行之PipeDream(1)--- Profile阶段
+
+[源码解析] 深度学习流水线并行 PipeDream(2)--- 计算分区
+
+[源码解析] 深度学习流水线并行 PipeDream(3)--- 转换模型
+
+[源码解析] 深度学习流水线并行 PipeDream(4)--- 运行时引擎
+
+
+0x01 前言
+通讯模块代码位于：runtime/communication.py。我们首先思考一下，通信模块需要哪些功能？
+
+    阶段（Stage）之间的通信，如果阶段在不同机器上如何处理？在同一个机器上如何处理？
+
+    因为是异步通信为主，不同节点的性能可能不同，是否需要一个缓存机制来协调不同节点，类似背压功能？
+
+    深度学习参数众多，涉及的张量和梯度众多，层数众多，每层的数据并行数目也不同，所以前向传播和反向传播如何保证按照确定次序运行？
+
+    因为节点上需要进行前向，后向传播，所以需要建立多个线程进行分别传输。
+
+因此我们下面分析时候，就结合这些问题进行思考。
+
+
+....
+
+
+4.1 发送逻辑
+发送的逻辑如下：
+
+    训练代码会调用StageRuntime.run_backward。
+
+    StageRuntime.run_backward 方法会调用 StageRuntime.send_tensors_backward 来发送张量 tensor_name。
+
+    send_tensors_backward 会调用 CommunicationHandler.send 来向 CommunicationHandler 的成员变量
+    backward_send_queues[tensor_name] [index] 添加这个张量。每个张量对应了若干个queue。这里就是个解耦合。
+
+    send 函数 会调用 backward_send_queues.add，这里会通知阻塞在queue上的 send_helper_thread 进行工作。
+
+    在 CommunicationHandler 的线程 send_helper_thread 中，之前就阻塞在queue这里，
+    此时会从 backward_send_queues[tensor_name] [index] 之中提取张量。
+
+    send_helper_thread 会调用 _send 来发送张量。
+
+    而最终调用的是 dist.send，就是PyTorch P2P。
+
+具体如下图：
+
+ StageRuntime            CommunicationHandler              send_helper_thread
+
+      +                           +                                 +
+      |                           |                                 |
+      | 1                         |                                 |
+      v                           |                                 |
+ run_backward                     |                                 |
+      |                           |                                 |
+      | 2                         |                                 |
+      |                           |                    wait on backward_send_queues
+      v                  3        v                                 |
+send_tensors_backward +--------> send                               |
+                                  |                                 |
+                                  |                                 |
+                                  |  4                              |
+                                  v               5                 v
+               backward_send_queues.add(tensor) +----> tensor = queue.remove()
+                                                notify              |
+                                                                    |
+                                                                    | 6
+                                                                    v
+                                                                  _send
+                                                                    |
+                                                                    | 7
+                                                                    |
+                                                                    v
+                                                                 dist.send
+
+4.2 接受逻辑
+接受逻辑如下：
+
+    StageRuntime 训练代码中调用 run_backward。
+
+    run_backward 调用 receive_tensors_backward。
+
+    receive_tensors_backward 调用 self.gradients[output_name] = self.comm_handler.recv 获取梯度。
+    CommunicationHandler 的 recv 函数会阻塞在 backward_receive_queues[tensor_name] [index] 之上。
+
+    同时，CommunicationHandler 的 recv_helper_thread 线程调用 _recv 接受其他stage点传来的张量。
+
+    _recv调用 dist.recv 或者 dist.broadcast 接受张量。
+
+    _recv 向 backward_receive_queues[tensor_name] [index] 添加张量。
+    这样就通知阻塞的 CommunicationHandler 的 recv 函数进行工作。
+
+    CommunicationHandler 的 recv 函数会从backward_receive_queues[tensor_name] [index] 提取梯度，
+    然后返回给 StageRuntime。就是 3 的返回。
+
+具体如下图：
+
+    StageRuntime             CommunicationHandler           recv_helper_thread
+          +                            +                            +
+          |                            |                            |
+          | 1                          |                            |
+          |                            |                            | 4
+          v                            |                            v
+    run_backward                       |                         _recv
+          |                            |                            |
+          |                            |                            |
+          |                            |                            | 5
+          |                            |                            |
+          | 2                          |                            v
+          |                            |                  dist.recv / dist.broadcast
+          |                            |                            |
+          v                  3         v                            |
+receive_tensors_backward +--------->  recv                          |
+          +                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            v                            |
+          |                 backward_receive_queues.remove()        |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |               wait on backward_receive_queues           |
+          |                            |                            |
+          |                            |                            |
+          |                            |                            |
+          |                            |                 6          v
+          |                  backward_receive_queues <-------+ queue.add(tensor)
+          |                            |               notify
+          |                            |  7
+          v                  3 return  |
+gradients[output_name] <---------------+
+
+
+...
+
+至此，通信模块已经分析完毕，下一篇终于要介绍 1F1B 了。
+
+0xFF 参考

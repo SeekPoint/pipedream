@@ -787,6 +787,7 @@ rank_in_stage 会传递给 Comm 模块。
     receive_tensors_backward 就是在后向传播中，从前面层获取张量。
     
     注意，这里对应的是self.send_ranks，就是前向过程中的发送rank，它们在反向过程中就是接受rank
+    
     '''
     def receive_tensors_backward(self):
         # Receive all required gradients from downstream
@@ -797,7 +798,7 @@ rank_in_stage 会传递给 Comm 模块。
 
              # 获取梯度
              self.gradients[output_name] = \
-                self.comm_handler.recv(
+                self.comm_handler.recv(  # 这里使用了  def recv(self
                     output_name,
                     forward_minibatch_id=self.forward_minibatch_id,
                     backward_minibatch_id=self.backward_minibatch_id,
@@ -814,6 +815,7 @@ rank_in_stage 会传递给 Comm 模块。
     send_tensors_forward就是在后向传播中，向后面层发送梯度张量。
     
     注意，这里对应的是self.receive_ranks，就是前向过程中的接受rank，它们在反向过程中就是发送rank
+    
     '''
     def send_tensors_backward(self):
         # Send all required gradients upstream.
